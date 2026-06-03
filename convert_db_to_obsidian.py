@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 """
-Convert russian-law-mcp SQLite database (uk-rf) → Obsidian vault .md files
-with YAML frontmatter, wiki-links, and MOCs.
-
-Usage: python3 convert_db_to_obsidian.py
+V2: Convert russian-law-mcp SQLite → Obsidian vault .md files
+Fixes: dotted article numbers, full titles from content, proper cross-refs,
+       correct chapter/section mapping for all 534 articles.
 """
 
-import sqlite3
-import json
-import re
-import os
-import unicodedata
+import sqlite3, json, re, os
+from collections import Counter, defaultdict
 
 DB_PATH = "/home/clawd/node_modules/@ansvar/russian-law-mcp/data/database.db"
 VAULT = "/home/clawd/uk-rf-vault"
@@ -18,21 +14,71 @@ STRUCT_PATH = f"{VAULT}/03-Resources/УК-РФ/structure.json"
 ARTICLES_DIR = f"{VAULT}/03-Resources/УК-РФ/Статьи"
 MOC_DIR = f"{VAULT}/06-MOC"
 
-# ─── Helpers ───────────────────────────────────────────────
+# ─── Article number mapping (DB format → real format) ───
+
+def db_to_real_article(db_num: str) -> str:
+    """Convert DB article number to real dotted format.
+    DB stores '1593' where real is '159.3', '1041' → '104.1' etc.
+    """
+    if not db_num.isdigit():
+        return db_num
+    
+    num = int(db_num)
+    if num <= 361:
+        return db_num  # no change needed
+    
+    s = db_num
+    # Try splitting from right: find longest valid base (1-361) + single-digit suffix
+    for split_point in range(len(s) - 1, 0, -1):
+        base = int(s[:split_point])
+        suffix = int(s[split_point:])
+        if 1 <= base <= 361 and 1 <= suffix <= 9:
+            return f"{base}.{suffix}"
+    
+    return db_num  # fallback
+
+
+# ─── Title extraction ───
+
+def extract_full_title(content: str, db_title: str) -> str:
+    """Extract full article title from content start.
+    DB title is truncated to ~63 chars. Full title is in content before the first numbered paragraph.
+    """
+    if not db_title or db_title == '':
+        return ''
+    
+    # If title doesn't end with comma, it's probably complete
+    if not db_title.rstrip().endswith(','):
+        return normalize_spaces(db_title)
+    
+    # Title continues in content: first lines before "1." or "(Наименование"
+    parts = re.split(r'\n\n(?=1\.\s)', content, maxsplit=1)
+    title_section = parts[0] if len(parts) > 1 else ''
+    
+    if not title_section:
+        return normalize_spaces(db_title)
+    
+    # Remove amendment notes like "(Наименование в редакции..."
+    title_section = re.sub(r'\n?\(Наименование.*?\)', '', title_section, flags=re.DOTALL)
+    title_section = title_section.strip()
+    
+    if title_section:
+        # Combine DB title start + continuation from content
+        # Keep trailing comma (it belongs in the title!) and append continuation
+        full_title = db_title.rstrip() + ' ' + title_section
+        return normalize_spaces(full_title)
+    
+    return normalize_spaces(db_title)
+
 
 def normalize_spaces(text: str) -> str:
-    """Remove excessive internal spaces from law text (DB artifact)."""
-    # Replace multiple spaces with single, but preserve paragraph breaks
+    """Remove excessive internal spaces from law text."""
     text = re.sub(r'[^\S\n]{2,}', ' ', text)
-    # Remove space before punctuation
     text = re.sub(r'\s+([,;:.!?)])', r'\1', text)
-    # Remove space after opening bracket
-    text = re.sub(r'([(])\s+', r'\1', text)
     return text.strip()
 
 
 def roman_to_int(roman: str) -> int:
-    """Convert Roman numeral to int."""
     vals = {'I':1,'V':5,'X':10,'L':50}
     result = 0
     for i, c in enumerate(roman):
@@ -43,170 +89,70 @@ def roman_to_int(roman: str) -> int:
     return result
 
 
-def int_to_roman(num: int) -> str:
-    """Convert int to Roman numeral."""
-    maps = [(12,'XII'),(11,'XI'),(10,'X'),(9,'IX'),(8,'VIII'),(7,'VII'),
-            (6,'VI'),(5,'V'),(4,'IV'),(3,'III'),(2,'II'),(1,'I')]
-    for n, r in maps:
-        if num >= n:
-            return r
-    return str(num)
+# ─── Cross-reference finder ───
 
-
-def slugify(text: str) -> str:
-    """Create filesystem-safe slug."""
-    text = text.lower().strip()
-    text = re.sub(r'[^\w\s-]', '', text)
-    text = re.sub(r'[\s_]+', '-', text)
-    return text[:80].rstrip('-')
-
-
-def find_cross_refs(content: str) -> set:
-    """
-    Find article cross-references in law text and return set of article numbers.
-    Patterns: ст.15, ст. 15, статьей 158, статьями 15 и 16, статьях 30, 31
+def find_cross_refs(content: str, all_real_nums: set) -> set:
+    """Find cross-references using Cyrillic patterns.
+    Handles: ст.105, ст. 228.1, статьей 159.3, статьях 15, 16, статьи 104.1
+    Returns set of real (dotted) article numbers.
     """
     refs = set()
     
-    # Pattern 1: ст.NN or ст. NN (most common)
-    for m in re.finditer(r'ст\.?\s*(\d{1,3}(?:\.\d)?)', content):
+    # Pattern 1: "ст.NN" or "ст. NN" or "ст.NN.N" (Cyrillic с)
+    for m in re.finditer(r'\u0441\u0442\.?\s+(\d+(?:\.\d+)?)', content):
         num_str = m.group(1)
-        # Filter: must be a valid УК РФ article (1-361 or dotted like 104.1)
-        base = num_str.split('.')[0]
-        if base.isdigit() and 1 <= int(base) <= 361:
-            refs.add(num_str)
+        # Convert from potential DB format: "1593" should be "159.3"
+        real_num = db_to_real_article(num_str) if num_str.isdigit() and len(num_str) > 3 else num_str
+        base = real_num.split('.')[0]
+        if base.isdigit() and 1 <= int(base) <= 361 and real_num in all_real_nums:
+            refs.add(real_num)
     
-    # Pattern 2: стат*/стать* NN[, NN, NN]
-    for m in re.finditer(r'стать(?:ь[ямив]?|ей|ёй|ями|ях|и)\s+((?:\d{1,3}(?:\.\d)?\s*(?:[,и]\s*)?)+)', content):
+    # Pattern 2: "стать*" + numbers (Cyrillic)
+    for m in re.finditer(r'\u0441\u0442\u0430\u0442[\u044c\u044f\u0439\u0435\u0438\u044e\u044e\u0443\u0432\u0445\u043c\u0430\u043b\u043d\u043e\u0434\u0436\u0437\u0440\u0441\u0442]+?\s+((?:\d+(?:\.\d+)?\s*(?:[,]\s*)?)+)', content):
         nums_part = m.group(1)
-        for nm in re.finditer(r'(\d{1,3}(?:\.\d)?)', nums_part):
+        for nm in re.finditer(r'(\d+(?:\.\d+)?)', nums_part):
             num_str = nm.group(1)
-            base = num_str.split('.')[0]
-            if base.isdigit() and 1 <= int(base) <= 361:
-                refs.add(num_str)
+            real_num = db_to_real_article(num_str) if num_str.isdigit() and len(num_str) > 3 else num_str
+            base = real_num.split('.')[0]
+            if base.isdigit() and 1 <= int(base) <= 361 and real_num in all_real_nums:
+                refs.add(real_num)
+    
+    # Pattern 3: also handle "ст. NNN" where NNN is DB format like "1593" for 159.3
+    # This is for references INSIDE content that use the same DB format
+    for m in re.finditer(r'\u0441\u0442\.?\s+(\d{3,4})', content):
+        num_str = m.group(1)
+        if num_str.isdigit() and int(num_str) > 361:
+            real_num = db_to_real_article(num_str)
+            base = real_num.split('.')[0]
+            if base.isdigit() and 1 <= int(base) <= 361 and real_num in all_real_nums:
+                refs.add(real_num)
     
     return refs
 
 
-def wiki_link_article(article_num: str, content: str, existing_articles: set) -> str:
+# ─── Build chapter/section mapping for ALL articles ───
+
+def build_full_mapping(struct, db_provisions):
+    """Map real article numbers → (section_roman, section_title, chapter_num, chapter_title)
+    Handles dotted articles by placing them after their base article in the same chapter.
     """
-    Replace references to articles with Obsidian wiki-links.
-    Only link if the target article exists in our vault.
-    """
-    def replace_ref(m):
-        prefix = m.group(1)  # "ст." or "статьей " etc
-        num = m.group(2)
-        base = num.split('.')[0]
-        if base.isdigit() and num in existing_articles:
-            return f"{prefix}[[ст.{num}|{num}]]"
-        return m.group(0)  # leave as-is
-    
-    # Replace ст.NN and ст. NN
-    content = re.sub(
-        r'(ст\.?\s+)(\d{1,3}(?:\.\d)?)',
-        replace_ref,
-        content
-    )
-    
-    return content
-
-
-def article_filename(article_num: str) -> str:
-    """Get filename for an article."""
-    return f"ст.{article_num}.md"
-
-
-def write_article_md(filepath: str, frontmatter: dict, title: str, content: str, 
-                      outgoing_refs: list, amended_notes: list):
-    """Write a single article .md file."""
-    # Clean content
-    content = normalize_spaces(content)
-    
-    # Build YAML frontmatter
-    yf_lines = ["---"]
-    for key in ['номер', 'заголовок', 'раздел', 'глава', 'статус', 'утратила_силу']:
-        if key in frontmatter and frontmatter[key]:
-            val = frontmatter[key]
-            if isinstance(val, str) and ('"' in val or ':' in val or '#' in val):
-                yf_lines.append(f'{key}: "{val}"')
-            else:
-                yf_lines.append(f'{key}: {val}')
-    if amended_notes:
-        yf_lines.append(f'редакции:')
-        for note in amended_notes:
-            yf_lines.append(f'  - "{note}"')
-    if outgoing_refs:
-        yf_lines.append(f'ссылки:')
-        for ref in sorted(outgoing_refs, key=lambda x: (float(x) if '.' in x else int(x))):
-            yf_lines.append(f'  - ст.{ref}')
-    yf_lines.append("---")
-    
-    # Body
-    body_lines = [f"# Статья {frontmatter.get('номер', '')}. {title}", ""]
-    
-    # Add section/chapter context
-    if frontmatter.get('раздел') or frontmatter.get('глава'):
-        ctx = []
-        if frontmatter.get('раздел'):
-            ctx.append(f"Раздел: [[{frontmatter['раздел']}]]")
-        if frontmatter.get('глава'):
-            ctx.append(f"Глава: [[{frontmatter['глава']}]]")
-        body_lines.append(" > " + " | ".join(ctx))
-        body_lines.append("")
-    
-    # Content
-    body_lines.append(content)
-    body_lines.append("")
-    
-    # Outgoing refs section
-    if outgoing_refs:
-        body_lines.append("## Ссылки на другие статьи")
-        body_lines.append("")
-        for ref in sorted(outgoing_refs, key=lambda x: (float(x) if '.' in x else int(x))):
-            body_lines.append(f"- [[ст.{ref}]]")
-        body_lines.append("")
-    
-    full_content = "\n".join(yf_lines) + "\n" + "\n".join(body_lines)
-    
-    with open(filepath, 'w', encoding='utf-8') as f:
-        f.write(full_content)
-
-
-# ─── Main conversion ───────────────────────────────────────
-
-def main():
-    os.makedirs(ARTICLES_DIR, exist_ok=True)
-    os.makedirs(MOC_DIR, exist_ok=True)
-    
-    # Connect to DB
-    db = sqlite3.connect(DB_PATH)
-    cur = db.cursor()
-    
-    # Load structure
-    with open(STRUCT_PATH) as f:
-        struct = json.load(f)
-    
-    # Build section/chapter maps from structure.json
-    section_map = {}  # roman → title (short)
-    chapter_map = {}  # "Раздел-Roman/Глава-N" → short title
-    chapter_full = {}  # glava_num → full title
-    section_full = {}  # roman → full title
-    article_to_chapter = {}  # art_num → (razdel_roman, glava_num)
+    # First: map base articles (1-361) from structure.json
+    article_to_chapter = {}  # num → (section_roman, glava_num)
+    section_full = {}   # roman → full title
+    chapter_full = {}   # (roman, glava) → full title
     
     for s in struct["sections"]:
         m = re.search(r'Razdel-([IVXL]+)', s["url"])
         if m:
             roman = m.group(1)
             section_full[roman] = s["title"]
-            # Short title: "Раздел I"
-            section_map[roman] = f"Раздел {roman}"
     
     for c in struct["chapters"]:
         m = re.search(r'Razdel-([IVXL]+)/Glava-(\d+)', c["url"])
         if m:
             roman = m.group(1)
             glava = int(m.group(2))
-            chapter_full[glava] = (roman, c["title"])
+            chapter_full[(roman, glava)] = c["title"]
     
     for a in struct["articles"]:
         m = re.search(r'Razdel-([IVXL]+)/Glava-(\d+)/Statya-(\d+)', a["url"])
@@ -216,142 +162,227 @@ def main():
             art_num = int(m.group(3))
             article_to_chapter[art_num] = (roman, glava)
     
-    # Get all provisions from DB
+    # Now: assign dotted articles to same chapter as base
+    full_mapping = {}
+    for db_num, title, content in db_provisions:
+        real_num = db_to_real_article(db_num)
+        
+        if '.' in real_num:
+            base = int(real_num.split('.')[0])
+        else:
+            base = int(real_num) if real_num.isdigit() else None
+        
+        if base and base in article_to_chapter:
+            roman, glava = article_to_chapter[base]
+            full_mapping[real_num] = {
+                'section_roman': roman,
+                'section_title': section_full.get(roman, f'Раздел {roman}'),
+                'chapter_num': glava,
+                'chapter_title': chapter_full.get((roman, glava), f'Глава {glava}'),
+            }
+        else:
+            full_mapping[real_num] = {
+                'section_roman': None,
+                'section_title': None,
+                'chapter_num': None,
+                'chapter_title': None,
+            }
+    
+    return full_mapping, section_full, chapter_full
+
+
+# ─── Write article .md ───
+
+def write_article(filepath, real_num, full_title, content, mapping, outgoing_refs, is_repealed, amended_notes):
+    """Write a single article .md file."""
+    content = normalize_spaces(content)
+    
+    # YAML frontmatter
+    yf = ["---"]
+    yf.append(f'номер: "{real_num}"')
+    # Ensure title is single-line for valid YAML
+    safe_title = full_title.replace('\n', ' ').replace('"', "'")
+    yf.append(f'заголовок: "{safe_title}"')
+    if mapping.get('section_title'):
+        yf.append(f'раздел: "Раздел {mapping["section_roman"]}"')
+    if mapping.get('chapter_num'):
+        yf.append(f'глава: "Глава {mapping["chapter_num"]}"')
+    if is_repealed:
+        yf.append('статус: "утратила силу"')
+    if amended_notes:
+        yf.append('редакции:')
+        for note in amended_notes:
+            yf.append(f'  - "{note}"')
+    if outgoing_refs:
+        yf.append('ссылки:')
+        for ref in sorted(outgoing_refs, key=lambda x: (float(x) if '.' in x else int(x))):
+            yf.append(f'  - "ст.{ref}"')
+    yf.append("---")
+    
+    # Body
+    # Title: ensure single-line
+    safe_h1_title = full_title.replace('\n', ' ')
+    body = [f"# Статья {real_num}. {safe_h1_title}", ""]
+    
+    # Context line
+    ctx = []
+    if mapping.get('section_roman'):
+        ctx.append(f"Раздел: [[Раздел {mapping['section_roman']}]]")
+    if mapping.get('chapter_num'):
+        ctx.append(f"Глава: [[Глава {mapping['chapter_num']}]]")
+    if ctx:
+        body.append("> " + " | ".join(ctx))
+        body.append("")
+    
+    # Main content
+    body.append(content)
+    body.append("")
+    
+    # Cross-refs
+    if outgoing_refs:
+        body.append("## Ссылки на другие статьи")
+        body.append("")
+        for ref in sorted(outgoing_refs, key=lambda x: (float(x) if '.' in x else int(x))):
+            body.append(f"- [[ст.{ref}]]")
+        body.append("")
+    
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write("\n".join(yf) + "\n" + "\n".join(body))
+
+
+# ─── Main ───
+
+def main():
+    os.makedirs(ARTICLES_DIR, exist_ok=True)
+    os.makedirs(MOC_DIR, exist_ok=True)
+    
+    db = sqlite3.connect(DB_PATH)
+    cur = db.cursor()
+    
+    with open(STRUCT_PATH) as f:
+        struct = json.load(f)
+    
+    # Get all provisions
     cur.execute("SELECT article, title, content FROM provisions WHERE law_id='uk-rf' ORDER BY order_index")
-    provisions = cur.fetchall()
+    db_provisions = cur.fetchall()
     db.close()
     
-    # First pass: collect all article numbers for wiki-link validation
-    all_article_nums = set()
-    for art, title, content in provisions:
-        all_article_nums.add(art)
+    print(f"DB provisions: {len(db_provisions)}")
     
-    print(f"Found {len(provisions)} provisions, {len(all_article_nums)} unique article numbers")
+    # Step 1: Convert all DB nums to real nums
+    all_real_nums = set()
+    db_to_real_map = {}
+    for db_num, title, content in db_provisions:
+        real = db_to_real_article(db_num)
+        db_to_real_map[db_num] = real
+        all_real_nums.add(real)
     
-    # Second pass: find all cross-refs and build article data
-    article_data = {}  # art_num → {title, content, section_roman, glava, status, outgoing_refs, amended}
+    print(f"Real article numbers: {len(all_real_nums)}")
     
-    for art, title, content in provisions:
-        # Determine section and chapter
-        art_int = int(art) if art.isdigit() else None
-        section_roman = None
-        glava_num = None
-        section_title = None
-        chapter_title = None
+    # Step 2: Build chapter/section mapping
+    full_mapping, section_full, chapter_full = build_full_mapping(struct, db_provisions)
+    
+    # Count articles with no mapping
+    no_map = sum(1 for v in full_mapping.values() if not v['section_roman'])
+    print(f"Articles without section/chapter mapping: {no_map}")
+    
+    # Step 3: Extract full titles and find cross-refs
+    article_data = {}
+    for db_num, db_title, content in db_provisions:
+        real_num = db_to_real_map[db_num]
+        mapping = full_mapping[real_num]
         
-        if art_int and art_int in article_to_chapter:
-            section_roman, glava_num = article_to_chapter[art_int]
-            section_title = section_map.get(section_roman, f"Раздел {section_roman}")
-            if glava_num in chapter_full:
-                _, ch_full = chapter_full[glava_num]
-                # Short chapter title: "Глава 16"
-                chapter_title = f"Глава {glava_num}"
+        # Extract full title
+        full_title = extract_full_title(content, db_title)
         
-        # Detect status
+        # Detect repealed FIRST (need for title fallback)
         status = "действует"
         is_repealed = False
-        if "утратил" in content.lower() or "утратила" in content.lower():
-            if len(content) < 200:  # Short content = likely fully repealed
+        if re.search(r'утратил[аи]?\s+силу', content, re.IGNORECASE):
+            if len(content) < 300:  # short = fully repealed
                 status = "утратила силу"
                 is_repealed = True
         
-        # Find amendments
-        amended_notes = re.findall(r'\(В редакции .*?\)', content)
-        amended_notes += re.findall(r'\(Дополнение.*?\)', content)
+        # If still empty, use contextual fallback
+        if not full_title:
+            if is_repealed:
+                full_title = "Утратила силу"
+            else:
+                full_title = f"Статья {real_num}"
         
-        # Clean title
-        clean_title = normalize_spaces(title) if title else ""
-        if not clean_title:
-            clean_title = f"Статья {art}"
+        # Amendments (max 1 note, truncated to 100 chars)
+        amended_notes = re.findall(r'\((?:В редакции|Дополнение)[^)]*\)', content)
+        # Keep only first note and truncate
+        if amended_notes:
+            first_note = amended_notes[0].replace('\n', ' ')
+            if len(first_note) > 100:
+                first_note = first_note[:97] + '...)'
+            amended_notes = [first_note]
+        else:
+            amended_notes = []
         
-        # Find cross-refs
-        refs = find_cross_refs(content)
-        # Remove self-reference
-        refs.discard(art)
-        # Only keep refs to existing articles
-        refs = refs & all_article_nums
+        # Cross-refs
+        refs = find_cross_refs(content, all_real_nums)
+        refs.discard(real_num)  # no self-references
         
-        article_data[art] = {
-            'title': clean_title,
+        article_data[real_num] = {
+            'real_num': real_num,
+            'db_num': db_num,
+            'full_title': full_title,
             'content': content,
-            'section_roman': section_roman,
-            'section_title': section_title,
-            'glava_num': glava_num,
-            'chapter_title': chapter_title,
-            'chapter_full': chapter_full.get(glava_num, (None, None))[1] if glava_num else None,
-            'status': status,
+            'mapping': mapping,
             'is_repealed': is_repealed,
             'amended_notes': amended_notes,
-            'outgoing_refs': sorted(refs),
-            'amended': len(amended_notes) > 0,
+            'outgoing_refs': refs,
         }
     
-    # Third pass: build incoming refs (backlinks)
-    incoming_refs = {}  # art_num → set of source articles
-    for art, data in article_data.items():
-        for ref in data['outgoing_refs']:
-            if ref not in incoming_refs:
-                incoming_refs[ref] = set()
-            incoming_refs[ref].add(art)
-    
-    # Fourth pass: write article .md files
+    # Step 4: Write all article .md files
     written = 0
-    for art, data in article_data.items():
-        filename = article_filename(art)
+    for real_num, data in sorted(article_data.items(), key=lambda x: (float(x[0].replace('.', '.')) if '.' in x[0] else int(x[0]))):
+        filename = f"ст.{real_num}.md"
         filepath = os.path.join(ARTICLES_DIR, filename)
         
-        frontmatter = {
-            'номер': art,
-            'заголовок': data['title'],
-        }
-        if data['section_title']:
-            frontmatter['раздел'] = data['section_title']
-        if data['chapter_title']:
-            frontmatter['глава'] = data['chapter_title']
-        if data['status'] != 'действует':
-            frontmatter['статус'] = data['status']
-        if data['is_repealed']:
-            frontmatter['утратила_силу'] = True
-        
-        write_article_md(
+        write_article(
             filepath=filepath,
-            frontmatter=frontmatter,
-            title=data['title'],
+            real_num=real_num,
+            full_title=data['full_title'],
             content=data['content'],
+            mapping=data['mapping'],
             outgoing_refs=data['outgoing_refs'],
-            amended_notes=data['amended_notes'][:5],  # cap at 5 in frontmatter
+            is_repealed=data['is_repealed'],
+            amended_notes=data['amended_notes'],
         )
         written += 1
     
-    print(f"✅ Written {written} article .md files to {ARTICLES_DIR}")
+    print(f"✅ Written {written} article .md files")
     
-    # ─── Generate MOC by sections ─────────────────────────
+    # Step 5: Generate MOCs
+    # Build hierarchy: section → chapter → articles
+    hierarchy = defaultdict(lambda: defaultdict(list))
     
-    # Build section → chapters → articles hierarchy
-    hierarchy = {}  # section_roman → {chapter_num → [article_nums]}
-    
-    for art, data in article_data.items():
-        sr = data['section_roman']
-        gn = data['glava_num']
+    for real_num, data in article_data.items():
+        m = data['mapping']
+        sr = m.get('section_roman')
+        gn = m.get('chapter_num')
         if sr and gn:
-            if sr not in hierarchy:
-                hierarchy[sr] = {}
-            if gn not in hierarchy[sr]:
-                hierarchy[sr][gn] = []
-            hierarchy[sr][gn].append(art)
+            hierarchy[sr][gn].append(real_num)
     
-    # Sort within each level
+    # Sort articles within chapters
+    def sort_key(art_num):
+        parts = art_num.split('.')
+        return (int(parts[0]), int(parts[1]) if len(parts) > 1 else 0)
+    
     for sr in hierarchy:
         for gn in hierarchy[sr]:
-            hierarchy[sr][gn].sort(key=lambda x: (float(x) if '.' in x else int(x)))
+            hierarchy[sr][gn].sort(key=sort_key)
     
-    # Write main УК РФ MOC
+    # Main MOC
     moc_path = os.path.join(MOC_DIR, "00-MOC-УК-РФ.md")
-    moc_lines = [
+    lines = [
         "# Уголовный кодекс Российской Федерации",
         "",
         "> [!info] Навигация по УК РФ",
-        "> 12 разделов · 34 главы · 361 статья",
+        f"> 12 разделов · 34 главы · {len(article_data)} статей",
         "",
         "## Структура кодекса",
         "",
@@ -359,21 +390,20 @@ def main():
     
     for roman in sorted(hierarchy.keys(), key=lambda r: roman_to_int(r)):
         full_title = section_full.get(roman, f"Раздел {roman}")
-        moc_lines.append(f"### [[Раздел {roman}|{full_title}]]")
-        moc_lines.append("")
+        lines.append(f"### [[Раздел {roman}|{full_title}]]")
+        lines.append("")
         
         for gn in sorted(hierarchy[roman].keys()):
-            ch_info = chapter_full.get(gn, (roman, f"Глава {gn}"))
-            ch_full = ch_info[1] if isinstance(ch_info, tuple) else ch_info
-            moc_lines.append(f"#### [[Глава {gn}|{ch_full}]]")
-            moc_lines.append("")
+            ch_full = chapter_full.get((roman, gn), f"Глава {gn}")
+            lines.append(f"#### [[Глава {gn}|{ch_full}]]")
+            lines.append("")
             
             for art in hierarchy[roman][gn]:
-                data = article_data.get(art, {})
-                title = data.get('title', '')
-                status_badge = " ⛔" if data.get('is_repealed') else ""
-                moc_lines.append(f"- [[ст.{art}]] — {title}{status_badge}")
-            moc_lines.append("")
+                data = article_data[art]
+                badge = " ⛔" if data['is_repealed'] else ""
+                short_title = data['full_title'].replace('\n', ' ')[:80]
+                lines.append(f"- [[ст.{art}]] — {short_title}{badge}")
+            lines.append("")
     
     # Stats
     total = len(article_data)
@@ -381,11 +411,9 @@ def main():
     repealed = sum(1 for d in article_data.values() if d['is_repealed'])
     total_refs = sum(len(d['outgoing_refs']) for d in article_data.values())
     
-    moc_lines.extend([
-        "---",
-        "",
-        "## Статистика",
-        "",
+    lines.extend([
+        "---", "",
+        "## Статистика", "",
         f"- Всего статей: **{total}**",
         f"- Действующих: **{active}**",
         f"- Утративших силу: **{repealed}**",
@@ -393,74 +421,58 @@ def main():
     ])
     
     with open(moc_path, 'w', encoding='utf-8') as f:
-        f.write("\n".join(moc_lines))
-    print(f"✅ Written main MOC: {moc_path}")
+        f.write("\n".join(lines))
+    print(f"✅ Written main MOC")
     
-    # Write section MOCs
+    # Section MOCs
     for roman in sorted(hierarchy.keys(), key=lambda r: roman_to_int(r)):
-        section_title = f"Раздел {roman}"
-        section_path = os.path.join(MOC_DIR, f"Раздел {roman}.md")
-        full_title = section_full.get(roman, section_title)
-        
+        sec_path = os.path.join(MOC_DIR, f"Раздел {roman}.md")
+        full_title = section_full.get(roman, f"Раздел {roman}")
         sec_lines = [f"# {full_title}", "", f"← [[00-MOC-УК-РФ|УК РФ]]", ""]
         
         for gn in sorted(hierarchy[roman].keys()):
-            ch_info = chapter_full.get(gn, (roman, f"Глава {gn}"))
-            ch_full = ch_info[1] if isinstance(ch_info, tuple) else ch_info
+            ch_full = chapter_full.get((roman, gn), f"Глава {gn}")
             sec_lines.append(f"## [[Глава {gn}|{ch_full}]]")
             sec_lines.append("")
-            
             for art in hierarchy[roman][gn]:
-                data = article_data.get(art, {})
-                title = data.get('title', '')
-                status_badge = " ⛔" if data.get('is_repealed') else ""
-                sec_lines.append(f"- [[ст.{art}]] — {title}{status_badge}")
+                data = article_data[art]
+                badge = " ⛔" if data['is_repealed'] else ""
+                short_title = data['full_title'].replace('\n', ' ')[:80]
+                sec_lines.append(f"- [[ст.{art}]] — {short_title}{badge}")
             sec_lines.append("")
         
-        with open(section_path, 'w', encoding='utf-8') as f:
+        with open(sec_path, 'w', encoding='utf-8') as f:
             f.write("\n".join(sec_lines))
     
     print(f"✅ Written {len(hierarchy)} section MOCs")
     
-    # Write chapter MOCs
-    chapter_count = 0
+    # Chapter MOCs
+    ch_count = 0
     for roman in hierarchy:
         for gn in hierarchy[roman]:
-            ch_info = chapter_full.get(gn, (roman, f"Глава {gn}"))
-            ch_full = ch_info[1] if isinstance(ch_info, tuple) else ch_info
+            ch_full = chapter_full.get((roman, gn), f"Глава {gn}")
             ch_path = os.path.join(MOC_DIR, f"Глава {gn}.md")
-            
-            ch_lines = [
-                f"# {ch_full}",
-                "",
-                f"← [[Раздел {roman}|Раздел {roman}]] · [[00-MOC-УК-РФ|УК РФ]]",
-                "",
-                "## Статьи",
-                "",
-            ]
+            ch_lines = [f"# {ch_full}", "", f"← [[Раздел {roman}|Раздел {roman}]] · [[00-MOC-УК-РФ|УК РФ]]", "", "## Статьи", ""]
             
             for art in hierarchy[roman][gn]:
-                data = article_data.get(art, {})
-                title = data.get('title', '')
-                status_badge = " ⛔" if data.get('is_repealed') else ""
-                ch_lines.append(f"- [[ст.{art}]] — {title}{status_badge}")
+                data = article_data[art]
+                badge = " ⛔" if data['is_repealed'] else ""
+                short_title = data['full_title'].replace('\n', ' ')[:80]
+                ch_lines.append(f"- [[ст.{art}]] — {short_title}{badge}")
             
             with open(ch_path, 'w', encoding='utf-8') as f:
                 f.write("\n".join(ch_lines))
-            chapter_count += 1
+            ch_count += 1
     
-    print(f"✅ Written {chapter_count} chapter MOCs")
+    print(f"✅ Written {ch_count} chapter MOCs")
     
-    # ─── Write summary stats ─────────────────────────────
-    print("\n" + "="*60)
-    print(f"CONVERSION COMPLETE")
+    print(f"\n{'='*60}")
+    print(f"CONVERSION V2 COMPLETE")
     print(f"  Articles: {written}")
     print(f"  Section MOCs: {len(hierarchy)}")
-    print(f"  Chapter MOCs: {chapter_count}")
-    print(f"  Main MOC: 1")
-    print(f"  Cross-refs found: {total_refs}")
-    print(f"  Active articles: {active}")
-    print(f"  Repealed articles: {repealed}")
+    print(f"  Chapter MOCs: {ch_count}")
+    print(f"  Cross-refs: {total_refs}")
+    print(f"  Active: {active}, Repealed: {repealed}")
 
 
 if __name__ == "__main__":
