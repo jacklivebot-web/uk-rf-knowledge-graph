@@ -1,0 +1,11 @@
+{
+  "defaultViewMode": "preview",
+  "livePreview": true,
+  "readableLineLength": true,
+  "attachmentFolderPath": "99-Templates/assets",
+  "newFileLocation": "folder",
+  "newFileFolderPath": "00-Inbox",
+  "useMarkdownLinks": false,
+  "showUnsupportedFiles": true,
+  "alwaysUpdateLinks": true
+}
